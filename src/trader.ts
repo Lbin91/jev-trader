@@ -79,7 +79,7 @@ export class Trader {
 
   /** Call once the market params are known. Without it `trades` in the state is all zeros and no fills are ever seen. */
   attachTradeFeed(sizeDec: number) {
-    this.trades = new TradeFeed({ market: config.market, url: config.readRpcUrl, sizeDec, maker: this.market.address });
+    this.trades = new TradeFeed({ market: config.market, url: config.readRpcUrl, sizeDec });
   }
 
   async onBlock(block: number) {
@@ -99,7 +99,9 @@ export class Trader {
       this.lastBook = book;
       this.mids.push(book.mid);
       if (this.mids.length > 400) this.mids.shift();
-      this.trades?.poll(block).then(() => this.harvest()); // off the hot path: eth_getLogs for prints (and our fills) since the last poll
+      this.trades?.poll(block - 1).then(() => this.harvest()); // off the hot path: eth_getLogs for prints (and our fills) since the last poll.
+      // One block behind on purpose: block N's logs can be back before this block's event is pushed
+      // to history, which would drop the `fill` field from the /history event (totals still count it).
 
       const decision = await this.model.decide(this.buildState(block, book));
       const wanted: Side = decision.action === "sell" ? "sell" : "buy";

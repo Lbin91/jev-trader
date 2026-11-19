@@ -1,10 +1,9 @@
 import { ethers } from "ethers";
-import * as Kuru from "@kuru-labs/kuru-sdk";
 import OrderBookAbi from "@kuru-labs/kuru-sdk/abi/OrderBook.json";
 import MarginAccountAbi from "@kuru-labs/kuru-sdk/abi/MarginAccount.json";
 import { config } from "./config";
 import { rpc } from "./chain";
-import { readBook as fetchBook, readVaultParams, vaultActive, log10 } from "./book";
+import { readBookV2, readMarketParamsV2, type MarketParamsV2, readVaultParams, vaultActive, log10 } from "./book";
 
 export interface Book {
   block: number;
@@ -69,7 +68,8 @@ export class Market {
   readonly provider = new ethers.providers.StaticJsonRpcProvider(config.rpcUrl, config.chainId);
   /** null in a dry run (no key, or DRY_RUN=true): nothing is signed, nothing is sent. */
   readonly wallet = config.dryRun ? null : new ethers.Wallet(config.privateKey!, this.provider);
-  params!: Kuru.MarketParams; // public so scripts can build txs without init()
+  /** v2 market params (Kuru 15 Oct 2026 redeploy). price/size/tick drive the quote price math. */
+  params!: MarketParamsV2 & { quoteAssetAddress: string; baseAssetDecimals: bigint; quoteAssetDecimals: bigint };
   /** Margin account balances, refreshed every `config.refreshBlocks`. Limit orders draw from here. */
   margin = { mon: 0, usdc: 0 };
   private iface = new ethers.utils.Interface(OrderBookAbi.abi);
@@ -86,7 +86,10 @@ export class Market {
   private get tickUnits() { return Number(this.params.tickSize.toString()); }
 
   async init() {
-    this.params = await Kuru.ParamFetcher.getMarketParams(this.provider, config.market);
+    const p = await readMarketParamsV2(config.readRpcUrl, config.market);
+    // Live-only fields the margin/deposit paths still reference. Correct for v2 MON-USDC
+    // (USDC 0x7547…b603, MON 18 decimals, USDC 6); the deposit path itself is legacy and unused in a dry run.
+    this.params = { ...p, quoteAssetAddress: "0x754704Bc059F8C67012fEd69BC8A327a5aafb603", baseAssetDecimals: 18n, quoteAssetDecimals: 6n };
     await this.refresh();
     if (!this.wallet) return;
     await this.resyncNonce();
@@ -104,13 +107,13 @@ export class Market {
     ]);
     if (fee.status === "fulfilled") this.feeWei = BN.from(fee.value);
     if (vault.status === "fulfilled") this.useVault = vaultActive(vault.value);
-    if (mon.status === "fulfilled" && mon.value) this.margin.mon = Number(ethers.utils.formatUnits(mon.value, this.params.baseAssetDecimals.toNumber()));
-    if (usdc.status === "fulfilled" && usdc.value) this.margin.usdc = Number(ethers.utils.formatUnits(usdc.value, this.params.quoteAssetDecimals.toNumber()));
+    if (mon.status === "fulfilled" && mon.value) this.margin.mon = Number(ethers.utils.formatUnits(mon.value, Number(this.params.baseAssetDecimals)));
+    if (usdc.status === "fulfilled" && usdc.value) this.margin.usdc = Number(ethers.utils.formatUnits(usdc.value, Number(this.params.quoteAssetDecimals)));
   }
 
-  /** One eth_call (two batched into one HTTP request once the vault is live). */
+  /** One eth_call against the v2 book (active + passive visible depth, top `levels` each side). */
   readBook(): Promise<Book> {
-    return fetchBook(config.readRpcUrl, config.market, this.params, { vault: this.useVault });
+    return readBookV2(config.readRpcUrl, config.market, this.params);
   }
 
   /**
@@ -129,26 +132,16 @@ export class Market {
   }
 
   /**
-   * Sign and fire one `batchUpdate`: cancel the given resting orders, post one new post-only limit
-   * order. Returns as soon as the RPC has the hash. `pollPending` resolves placed/reverted later.
+   * In a dry run: price the order and return it as `sim` (rests one block, filled by a real
+   * crossing print). Live: not supported since the 15 Oct 2026 Kuru redeploy (see below).
    */
   async send(block: number, side: Side, sizeMon: number, book: Book, cancel: number[], capped: boolean): Promise<Quote> {
     const price = this.quotePrice(side, book);
     if (!this.wallet) return { side, price, size: sizeMon, txHash: null, gasMon: 0, cancel, status: "sim", orderId: null, capped };
-
-    const tx = this.buildTx(side, sizeMon, price, cancel);
-    const signed = await this.wallet.signTransaction(tx);
-    let hash: string;
-    try {
-      hash = await rpc<string>("eth_sendRawTransaction", [signed]);
-      this.nonce++;
-    } catch (e) {
-      await this.resyncNonce().catch(() => {});
-      throw e;
-    }
-    const quote: Quote = { side, price, size: sizeMon, txHash: hash, gasMon: this.gasMon(this.gasLimit, this.feeWei), cancel, status: "sent", orderId: null, capped };
-    this.pending.set(hash, { block, quote, gasLimit: this.gasLimit });
-    return quote;
+    // The 15 Oct 2026 Kuru redeploy replaced batchUpdate/margin accounts with batch(userId, …) over
+    // AccountCore. The legacy encode() below no longer exists on-chain; fail fast instead of sending
+    // a transaction that can only revert. Port to batch() + AccountCore deposits to trade live.
+    throw new Error("live trading needs the v2 OrderBook batch() path; run with DRY_RUN=true (or unset PRIVATE_KEY)");
   }
 
   /** One eth_getTransactionReceipt per in-flight tx. Returns whatever resolved (or timed out). */
@@ -210,7 +203,7 @@ export class Market {
   /** Top the margin account up to MARGIN_MON / MARGIN_USDC. Runs once at startup, awaiting each receipt. */
   private async ensureMargin() {
     const w = this.wallet!;
-    const baseDec = this.params.baseAssetDecimals.toNumber(), quoteDec = this.params.quoteAssetDecimals.toNumber();
+    const baseDec = Number(this.params.baseAssetDecimals), quoteDec = Number(this.params.quoteAssetDecimals);
     const [monBal, usdcBal] = await Promise.all([this.marginBalance(ZERO_ADDRESS), this.marginBalance(this.params.quoteAssetAddress)]);
     const mon = Number(ethers.utils.formatUnits(monBal, baseDec)), usdc = Number(ethers.utils.formatUnits(usdcBal, quoteDec));
     const deposit = async (token: string, amount: ethers.BigNumber, native: boolean) => {

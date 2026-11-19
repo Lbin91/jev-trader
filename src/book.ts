@@ -48,10 +48,101 @@ export interface L2Book {
   asks: Level[];
 }
 
-export const SEL_GET_L2_BOOK = "0x46fdfbb1"; // getL2Book()
-export const SEL_GET_VAULT_PARAMS = "0x88bb4f60"; // getVaultParams()
+export const SEL_GET_L2_BOOK = "0x46fdfbb1"; // getL2Book() — legacy pre-2026-10 deployment
+export const SEL_GET_VAULT_PARAMS = "0x88bb4f60"; // getVaultParams() — legacy
 const ADDRESS_ZERO = "0x0000000000000000000000000000000000000000";
 const MAX_UINT256 = (1n << 256n) - 1n;
+
+// ---------------------------------------------------------------------------------------------
+// Spot OrderBook v2 (Kuru mainnet redeploy, 15 Oct 2026). Prices are pricePrecision-scaled
+// integers (verified against the WETH-USDC book: 21353000 / 1e4 = $2135.3); sizes are
+// sizePrecision-scaled. getMarketParams() returns (pricePrecision, sizePrecision, tickSize,
+// minQuoteNotional, maxQuoteNotional, makerFeePps, takerFeePps).
+// ---------------------------------------------------------------------------------------------
+
+/** getL2Book(uint256) — keccak("getL2Book(uint256)")[0:4]. */
+export const SEL_GET_L2_BOOK_V2 = "0xb4cc4b1a";
+/** getMarketParams() — keccak("getMarketParams()")[0:4]. */
+export const SEL_GET_MARKET_PARAMS_V2 = "0x90c9427c";
+/** bestBidAsk() — keccak("bestBidAsk()")[0:4]. */
+export const SEL_BEST_BID_ASK_V2 = "0xb4de8b70";
+
+export interface MarketParamsV2 {
+  pricePrecision: bigint;
+  sizePrecision: bigint;
+  tickSize: bigint;
+  minQuoteNotional: bigint;
+  maxQuoteNotional: bigint;
+  makerFeePps: bigint;
+  takerFeePps: bigint;
+}
+
+/** Decode one ABI-encoded return word per field (every getMarketParams field fits one slot). */
+export function decodeMarketParamsV2(abiHex: string): MarketParamsV2 {
+  const hex = abiHex.startsWith("0x") ? abiHex.slice(2) : abiHex;
+  if (hex.length < 64 * 7) throw new Error("getMarketParams: short return data");
+  const w = (i: number) => BigInt("0x" + hex.slice(i * 64, (i + 1) * 64));
+  return { pricePrecision: w(0), sizePrecision: w(1), tickSize: w(2), minQuoteNotional: w(3), maxQuoteNotional: w(4), makerFeePps: w(5), takerFeePps: w(6) };
+}
+
+/** One eth_call for the v2 market params. */
+export async function readMarketParamsV2(provider: RpcProvider, market: string): Promise<MarketParamsV2> {
+  const json = await rpcPost(urlOf(provider), ethCall(1, market, SEL_GET_MARKET_PARAMS_V2, "latest"));
+  if (!json?.result) throw new Error(`getMarketParams: ${json?.error?.message ?? "no result"}`);
+  return decodeMarketParamsV2(json.result);
+}
+
+/** Decode an ABI-encoded uint256/uint96/... array: `slot` = word index of the offset word; the
+ *  offset itself is absolute (from the start of the return data). */
+function decodeUintArray(data: string, slot: number): bigint[] {
+  const out: bigint[] = [];
+  const head = BigInt("0x" + data.slice(slot * 64, slot * 64 + 64));
+  const at = Number(head) * 2; // byte offset -> hex chars, from the start of data
+  const len = Number(BigInt("0x" + data.slice(at, at + 64)));
+  for (let i = 0; i < len; i++) out.push(BigInt("0x" + data.slice(at + 64 + i * 64, at + 64 + (i + 1) * 64)));
+  return out;
+}
+
+/**
+ * Read the v2 book: getL2Book(levels) returns (uint32[] bidPrices, uint96[] bidSizes,
+ * uint32[] askPrices, uint96[] askSizes), bids descending and asks ascending, combined
+ * active + passive visible depth. One eth_call, same Book shape as the legacy reader.
+ */
+export async function readBookV2(provider: RpcProvider, market: string, params: MarketParamsV2, levels = 20): Promise<Book> {
+  const data = SEL_GET_L2_BOOK_V2 + BigInt(levels).toString(16).padStart(64, "0");
+  const json = await rpcPost(urlOf(provider), ethCall(1, market, data, "latest"));
+  if (!json?.result) throw new Error(`getL2Book: ${json?.error?.message ?? "no result"}`);
+  const hex = json.result.slice(2);
+  const bidP = decodeUintArray(hex, 0), bidS = decodeUintArray(hex, 1);
+  const askP = decodeUintArray(hex, 2), askS = decodeUintArray(hex, 3);
+  const pDec = log10Big(params.pricePrecision), sDec = log10Big(params.sizePrecision);
+  const bids: Level[] = bidP.map((p, i) => [toFloat(p, pDec), toFloat(bidS[i]!, sDec)]);
+  const asks: Level[] = askP.map((p, i) => [toFloat(p, pDec), toFloat(askS[i]!, sDec)]);
+  bids.sort(desc);
+  asks.sort((a, b) => a[0] - b[0]);
+  if (!bids.length || !asks.length) throw new Error(`empty book side (bids=${bids.length} asks=${asks.length})`);
+  return buildBookFromLevels(bids, asks);
+}
+
+const log10Big = (x: bigint) => x.toString().length - 1;
+
+/** Shared Book assembly from already-sorted, already-priced levels (best bid / ask first). */
+export function buildBookFromLevels(bids: Level[], asks: Level[]): Book {
+  const bid = bids[0]![0], ask = asks[0]![0];
+  const mid = (bid + ask) / 2;
+  const near = (levels: Level[]) => levels.filter((l) => Math.abs(l[0] - mid) / mid < 0.01).reduce((s, l) => s + l[1], 0);
+  const bidDepth = near(bids), askDepth = near(asks);
+  const within = (levels: Level[], bps: number) => levels.filter((l) => (Math.abs(l[0] - mid) / mid) * 10_000 <= bps).reduce((s, l) => s + l[1], 0);
+  const depthBps: Book["depthBps"] = {};
+  for (const b of [10, 25, 50]) depthBps[String(b)] = { bid: within(bids, b), ask: within(asks, b) };
+  return {
+    block: 0, bid, ask, mid,
+    spreadBps: ((ask - bid) / mid) * 10_000,
+    imbalance: bidDepth + askDepth ? (bidDepth - askDepth) / (bidDepth + askDepth) : 0,
+    levels: { bids: bids.slice(0, 5), asks: asks.slice(0, 5) },
+    depthBps,
+  };
+}
 
 type RpcProvider = ethers.providers.JsonRpcProvider | string;
 const urlOf = (p: RpcProvider) => (typeof p === "string" ? p : p.connection.url);

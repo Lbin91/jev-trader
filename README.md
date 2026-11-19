@@ -2,6 +2,12 @@
 
 One decision every Monad block. A TypeSafe Jev model watches the Kuru MON-USDC order book and answers buy or sell every ~300 ms. Every block posts a real post-only limit order on that side, one tick inside the touch, replacing the last one. Fills happen when a taker hits it, so the bot earns the spread instead of paying it. A small server streams every block to the dashboard.
 
+> Kuru redeployed its Monad mainnet books on 15 Oct 2026 (Spot v2: AccountCore custody, `batch()`
+> orders, packed events; all market addresses changed). The read path (book, market params, trade
+> prints) is ported to v2 and dry runs against the live book. Live order placement is not ported
+> yet: with a `PRIVATE_KEY` set the bot refuses to send rather than posting the legacy
+> `batchUpdate` calldata, which the v2 OrderBook no longer knows.
+
 ## Run
 
     cp .env.example .env

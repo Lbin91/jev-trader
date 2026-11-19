@@ -6,13 +6,14 @@ export const config = {
   readRpcUrl: env("READ_RPC_URL", "https://rpc.monad.xyz")!, // book reads + eth_blockNumber polling + trade logs
   wsUrl: env("WS_URL"), // optional; polling backstop always runs
   chainId: 143,
-  market: env("MARKET", "0x065C9d28E428A0db40191a54d33d5b7c71a9C394")!, // Kuru MON-USDC
-  /** Kuru MarginAccount this market settles against (slot 73 of the OrderBook proxy; verifiedMarket(market) is true). */
+  /** Kuru MON-USDC OrderBook (Spot v2 redeploy, 15 Oct 2026). The legacy 0x065C9d28… book is one-sided/drained. */
+  market: env("MARKET", "0xc9dE998e272d59a19CEA3783C8dd44f87A86405D")!,
+  /** Legacy Kuru MarginAccount (pre-redeploy). Unused in a dry run; live trading needs the new AccountCore/batch() path. */
   marginAccount: env("MARGIN_ACCOUNT", "0x2A68ba1833cDf93fa9Da1EEbd7F46242aD8E90c5")!,
   privateKey: env("PRIVATE_KEY"),
   dryRun: env("DRY_RUN") === "true" || !env("PRIVATE_KEY"),
-  tradeSizeMon: Number(env("TRADE_SIZE_MON", "200")), // Kuru MON-USDC minimum order is 200 MON
-  maxPositionMon: Number(env("MAX_POSITION_MON", "1000")),
+  tradeSizeMon: Number(env("TRADE_SIZE_MON", "1000")), // the v2 book enforces a 10 USDC minimum GTC notional; MON ~0.016 → ≥625 MON
+  maxPositionMon: Number(env("MAX_POSITION_MON", "5000")),
   bankrollUsd: Number(env("BANKROLL_USD", "100")), // used for pnlPct
   /** Quote this many ticks inside the touch (0 = join the best bid/ask). Never crosses: clamps to the touch when the spread is too tight. */
   quoteInsideTicks: Number(env("QUOTE_INSIDE_TICKS", "1")),
